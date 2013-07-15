@@ -11,22 +11,16 @@ class Facets
 	public function __construct()
 	{
 		// initialize scriblio facets once things have settled (init is too soon for some plugins)
-		add_action( 'wp_loaded' , array( $this , 'wp_loaded' ), 1);
-		add_action( 'parse_query' , array( $this , 'parse_query' ) , 1 );
-		$this->add_filters();
-
+		add_action( 'parse_query' , array( $this , 'parse_query' ), 1 );
 		add_action( 'template_redirect' , array( $this, '_count_found_posts' ), 0 );
-		add_shortcode( 'scrib_hit_count', array( $this, 'shortcode_hit_count' ));
-		add_shortcode( 'facets' , array( $this, 'shortcode_facets' ));
+
+		add_shortcode( 'scrib_hit_count', array( $this, 'shortcode_hit_count' ) );
+		add_shortcode( 'facets' , array( $this, 'shortcode_facets' ) );
 
 		// initialize a standard object to collect facet data
 		$this->facets = new stdClass;
 	}
 
-	public function wp_loaded()
-	{
-		do_action( 'scrib_register_facets' );
-	}//end wp_loaded
 
 	public function is_browse()
 	{
@@ -36,17 +30,32 @@ class Facets
 	public function register_facet( $facet_name , $facet_class , $args = array() )
 	{
 		$args = wp_parse_args( $args, array(
-			'has_rewrite' => FALSE, 
-			'priority' => 5, 
+			'has_rewrite' => FALSE,
+			'priority' => 5,
 		));
 
+		// if the class hasn't been loaded yet and it's an internal class, then load it
+		if ( ! class_exists( $facet_class ) )
+		{
+			// format the filesystem path to try to load this class file from
+			$class_path = __DIR__ . '/class-' . str_replace( '_', '-', sanitize_title_with_dashes( $facet_class ) ) . '.php';
+
+			// check if this class file is an internal class, try to load it
+			if ( file_exists( $class_path ) )
+			{
+				require_once $class_path;
+			}
+		}
+
 		// instantiate the facet
-		if( class_exists( $facet_class ))
+		if ( class_exists( $facet_class ) )
 		{
 			$this->facets->$facet_name = new $facet_class( $facet_name , $args , $this );
 		}
 		else
+		{
 			return FALSE;
+		}
 
 		// register the query var and associate it with this facet
 		$query_var = $this->facets->$facet_name->register_query_var();
@@ -58,14 +67,27 @@ class Facets
 		if( ( 9 > $args['priority'] ) && ( ! $args['has_rewrite'] ) )
 			$args['priority'] = 9;
 		$this->priority[ $facet_name ] = (int) $args['priority'];
-		
+
 	}
 
 	public function parse_query( $query )
 	{
 
+		// don't continue if `suppress_filters` is set
+		if( isset( $query->query['suppress_filters'] ) && $query->query['suppress_filters'] )
+		{
+			return $query;
+		}
+
 		// remove the action so it only runs on the main query and the vars don't get reset
 		remove_action( 'parse_query' , array( $this , 'parse_query' ) , 1 );
+
+		// don't do a query to find all matching posts if this request is for a single post
+		if( ! $query->is_singular )
+		{
+			// add the post_request filter so we can generate SQL for the facet/filter counts
+			add_filter( 'posts_request', array( $this, 'posts_request' ), 11 );
+		}
 
 		// identify the selected search terms
 		$searched = array_intersect_key( $query->query , $this->_query_vars );
@@ -88,12 +110,19 @@ class Facets
 	}
 
 	/**
-	 * add any filters used by this class. this allows the user to control
-	 * if the filters should be run again after specific WP_Query calls.
+	 * reset filters and actions used by scriblio. this allows the user to
+	 * control when the filters/actions should be run again after specific
+	 * WP_Query calls.
 	 */
-	public function add_filters()
+	public function reset()
 	{
-		add_filter( 'posts_request', array( $this, 'posts_request' ), 11 );
+		// the parse_query removes itself after being called,
+		// so add it again when we reset to apply to the next WP_Query().
+		add_action( 'parse_query' , array( $this , 'parse_query' ) , 1 );
+
+		// clear out any previous matches
+		$this->_matching_tax_facets = array();
+		unset( $this->matching_post_ids );
 	}
 
 	public function posts_request( $query )
@@ -110,7 +139,17 @@ class Facets
 		// deregister this filter after it's run on the first/default query
 		remove_filter( 'posts_request', array( $this , 'posts_request' ), 11 );
 
-		$this->matching_post_ids_sql = str_replace( $wpdb->posts .'.* ', $wpdb->posts .'.ID ', str_replace( 'SQL_CALC_FOUND_ROWS', '', preg_replace( '/LIMIT[^0-9]*([0-9]*)[^0-9]*([0-9]*)/i', 'LIMIT \1, '. $this->_foundpostslimit , $query )));
+		$this->matching_post_ids_sql = str_replace(
+			$wpdb->posts .'.* ', $wpdb->posts .'.ID ',
+			str_replace(
+				'SQL_CALC_FOUND_ROWS', '',
+				preg_replace(
+					'/LIMIT[^0-9]*([0-9]*)[^0-9]*([0-9]*)/i',
+					'LIMIT \1, '. $this->_foundpostslimit,
+					$query
+				)
+			)
+		) . ' /* generated in Facets::posts_request() */';
 
 //echo "<h2>$this->matching_post_ids_sql</h2>";
 
@@ -119,17 +158,35 @@ class Facets
 
 	public function get_matching_post_ids()
 	{
-		if( is_array( $this->matching_post_ids ))
+		if( isset( $this->matching_post_ids ) )
+		{
 			return $this->matching_post_ids;
+		}
+
+		// short circuit if this is a single post
+		if( is_singular() )
+		{
+			$this->matching_post_ids = (array) get_queried_object_id();
+			return $this->matching_post_ids;
+		}
 
 		$cache_key = md5( $this->matching_post_ids_sql );
 
 		if( ! $this->matching_post_ids = wp_cache_get( $cache_key , 'scrib-matching-post-ids' ))
 		{
-			global $wpdb;
-	
-			$this->matching_post_ids = $wpdb->get_col( $this->matching_post_ids_sql );
+			// apply a filter to allow other plugins to generate the list of
+			// matching post IDs. the filter _must_ return an empty array()
+			// if there are no results, otherwise execution will continue
+			// against MySQL below
+			$this->matching_post_ids = apply_filters( 'scriblio_pre_get_matching_post_ids', FALSE, $this->_foundpostslimit );
 
+			// if no filters are hooked above, the result will be FALSE and
+			// we'll look in MySQL to find the matching post IDs
+			if ( FALSE === $this->matching_post_ids)
+			{
+				global $wpdb;
+				$this->matching_post_ids = $wpdb->get_col( $this->matching_post_ids_sql );
+			}
 			wp_cache_set( $cache_key , $this->matching_post_ids , 'scrib-matching-post-ids' , $this->ttl );
 		}
 
@@ -172,8 +229,8 @@ class Facets
 
 		// configure how it's displayed
 		$display_options = array(
-			'format' => 'list', 
-			'smallest' => floatval( $arg['format_font_small'] ) ? floatval( $arg['format_font_small'] ) : 1, 
+			'format' => 'list',
+			'smallest' => floatval( $arg['format_font_small'] ) ? floatval( $arg['format_font_small'] ) : 1,
 			'largest' => floatval( $arg['format_font_large'] ) ? floatval( $arg['format_font_large'] ) : 1,
 			'number' => absint( $arg['number'] ) ? absint( $arg['number'] ) : 25,
 			'unit' => 'em',
@@ -256,14 +313,14 @@ class Facets
 		global $wp_rewrite;
 
 		$args = wp_parse_args( $args, array(
-			'smallest' => 8, 
-			'largest' => 22, 
-			'unit' => 'pt', 
+			'smallest' => 8,
+			'largest' => 22,
+			'unit' => 'pt',
 			'number' => 45,
-			'name' => 'name', 
-			'format' => 'flat', 
-			'orderby' => 'name', 
-			'order' => 'ASC', 
+			'name' => 'name',
+			'format' => 'flat',
+			'orderby' => 'name',
+			'order' => 'ASC',
 		));
 		extract( $args );
 
@@ -273,8 +330,8 @@ class Facets
 		$counts = array();
 		foreach ( (array) $tags as $tag )
 		{
-			$counts[ $tag->facet .':'. $tag->slug ] = $tag->count;
-			$tag_info[ $tag->facet .':'. $tag->slug ] = $tag;
+			$counts[ $tag->slug . ':' . $tag->facet ] = $tag->count;
+			$tag_info[ $tag->slug . ':' . $tag->facet ] = $tag;
 		}
 
 		if ( ! $counts )
@@ -309,32 +366,30 @@ class Facets
 		$a = array();
 		foreach ( $counts as $tag => $count )
 		{
-			$is_selected = $this->facets->{$tag_info[ $tag ]->facet}->selected( $tag_info[ $tag ] );
+			$is_selected = $this->facets->{ $tag_info[ $tag ]->facet }->selected( $tag_info[ $tag ] );
 
-			$data = array(
-				'url'         => $this->permalink( $tag_info[ $tag ]->facet , $tag_info[ $tag ] , (int) ! $is_selected ),
-				'count'       => $count,
-				'selected'    => $is_selected,
-				'title'       => esc_attr( sprintf( __('%d topics') , $count )),
-				'size'        => ( $smallest + ( ( $count - $min_count ) * $font_step ) ) . $unit,
-				'description' => wp_specialchars( $name == 'description' ? $tag_info[ $tag ]->description : $tag_info[ $tag ]->name ),
-				'slug'        => wp_specialchars( $tag_info[ $tag ]->slug ),
-				'taxonomy'    => wp_specialchars( $this->facets->{$tag_info[ $tag ]->facet}->taxonomy ),
+			$term_name = apply_filters(
+				'scriblio_facets_facet_description',
+				trim( $name == 'description' ? $tag_info[ $tag ]->description : $tag_info[ $tag ]->name ),
+				$tag_info[ $tag ]->facet
 			);
 
-			if ( 'post_tag' == $data['taxonomy'] )
-			{
-				$data['taxonomy'] = 'tag';
-			}//end if
+			$before_link = apply_filters( 'scriblio_facets_tag_cloud_pre_link', '', $tag_info[ $tag ]->facet, $count, $this->count_found_posts );
 
-			$data['description'] = apply_filters( 'scriblio_facets_facet_description', $data['description'], $tag_info[ $tag ]->facet );
-
-			$a[] = '
-				<li ' . ( $data['selected'] ? 'class="selected"' : '' ) . ' data-taxonomy="' . $data['taxonomy'] . '" data-term="' . $data['slug'] . '">
-					<a href="'. $data['url'] .'" class="tag-link'. ( $data['selected'] ? ' selected' : '' ) . '" title="'. $data['title'] .'"'.
-					( in_array( $format , array( 'array' , 'list' )) ? '' : ' style="font-size: ' . $size .';"' ) .
-					'>' . $data['description'] .' <span class="count">' . number_format( $data['count'] ) . '</span></a>
-				</li>' ;
+			$a[] = sprintf(
+				'<%1$s class="%2$s" data-term="%3$s" data-taxonomy="%4$s" data-term-url="%5$s">%11$s<a href="%6$s" class="term-link" title="%7$s"%8$s>%9$s%10$s</a></%1$s>',
+				( 'list' == $format ? 'li' : 'span' ),
+				( $is_selected ? 'selected' : '' ),
+				esc_attr( $term_name ),
+				esc_attr( $this->facets->{ $tag_info[ $tag ]->facet }->label ),
+				$this->permalink( $tag_info[ $tag ]->facet , $tag_info[ $tag ] , -1 ),
+				$this->permalink( $tag_info[ $tag ]->facet , $tag_info[ $tag ] , (int) ! $is_selected ),
+				esc_attr( sprintf( __('%d topics') , $count ) ),
+				( 'list' == $format ? '' : 'style="font-size: ' . ( $smallest + ( ( $count - $min_count ) * $font_step ) ) . $unit .';"' ),
+				wp_specialchars( $term_name ),
+				( 'list' == $format ? '<span class="count"><span class="meta-sep">&nbsp;</span>' . number_format( $count ) . '</span>' : '' ),
+				$before_link
+			);
 		}
 
 		switch( $format )
@@ -344,11 +399,13 @@ class Facets
 				break;
 
 			case 'list' :
-				$return = "<ul class='wp-tag-cloud'>\n\t". join( "\n\t", $a ) ."\n</ul>\n";
+				$return = "<ul class='wp-tag-cloud'>\n\t". convert_chars( wptexturize( join( "\n\t", $a ) ) ) ."\n</ul>\n";
 				break;
 
+			case 'flat' :
+			case 'cloud' :
 			default :
-				$return = "<ul class='wp-tag-cloud'>\n". convert_chars( wptexturize( join( "\n", $a ))) ."\n</ul>\n";
+				$return = "<div class='wp-tag-cloud'>\n". convert_chars( wptexturize( join( "\n", $a ) ) ) ."\n</div>\n";
 		}
 
 		return $return;
@@ -359,7 +416,7 @@ class Facets
 		global $wpdb, $wp_query, $bsuite;
 
 		$return_string = '';
-		if( ! empty( $this->selected_facets ))
+		if( ! empty( $this->selected_facets ) )
 		{
 
 			// how many facets are currently selected?
@@ -410,15 +467,15 @@ class Facets
 
 		return FALSE;
 	}
-	
+
 	public function build_labels( $sing , $plur , $singcap = '' , $plurcap = '' )
 	{
 		if( empty( $singcap ))
 			$singcap = ucwords( $sing );
-	
+
 		if( empty( $plurcap ))
 			$plurcap = ucwords( $plur );
-	
+
 		$labels = array(
 			'name' => $plurcap,
 			'singular_name' => $singcap,
@@ -435,11 +492,10 @@ class Facets
 			'add_or_remove_items' => 'Add or remove '. $sing,
 			'choose_from_most_used' => 'Choose from the most used '. $sing,
 		);
-	
+
 		return (object) $labels;
 	}
 }
-$facets = new Facets;
 
 
 
@@ -463,12 +519,4 @@ interface Facet
 	function queryterm_remove( $term , $current );
 
 	function permalink( $terms );
-}
-
-
-
-function scrib_register_facet( $name , $type , $args = array() )
-{
-	global $facets;
-	$facets->register_facet( $name , $type , $args );
 }
